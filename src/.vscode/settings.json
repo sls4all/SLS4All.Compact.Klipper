@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "*.json": "jsonc",
+        "stepper.h": "c"
+    }
+}

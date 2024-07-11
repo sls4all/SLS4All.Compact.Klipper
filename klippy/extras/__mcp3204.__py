@@ -1,0 +1,91 @@
+# Support for common SPI based thermocouple and RTD temperature sensors
+#
+# Copyright (C) 2018  Petri Honkala <cruwaller@gmail.com>
+# Copyright (C) 2018  Kevin O'Connor <kevin@koconnor.net>
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+import math
+from . import bus
+
+
+######################################################################
+# SensorBase
+######################################################################
+
+REPORT_TIME = 0.300
+
+class SensorBase:
+    def __init__(self, config, chip_type, config_cmd=None, spi_mode=0):
+        self.printer = config.get_printer()
+        self.chip_type = chip_type
+        self._callback = None
+        self.min_sample_value = self.max_sample_value = 0
+        self._report_clock = 0
+        self.spi = bus.MCU_SPI_from_config(
+            config, spi_mode, pin_option="sensor_pin", default_speed=10000)
+        if config_cmd is not None:
+            self.spi.spi_send(config_cmd)
+        self.mcu = mcu = self.spi.get_mcu()
+        # Reader chip configuration
+        self.oid = oid = mcu.create_oid()
+        mcu.register_response(self._handle_spi_response,
+                              "thermocouple_result", oid)
+        mcu.register_config_callback(self._build_config)
+    def setup_minmax(self, min_temp, max_temp):
+        adc_range = [self.calc_adc(min_temp), self.calc_adc(max_temp)]
+        self.min_sample_value = min(adc_range)
+        self.max_sample_value = max(adc_range)
+    def setup_callback(self, cb):
+        self._callback = cb
+    def get_report_time_delta(self):
+        return REPORT_TIME
+    def _build_config(self):
+        self.mcu.add_config_cmd(
+            "config_thermocouple oid=%u spi_oid=%u thermocouple_type=%s" % (
+                self.oid, self.spi.get_oid(), self.chip_type))
+        clock = self.mcu.get_query_slot(self.oid)
+        self._report_clock = self.mcu.seconds_to_clock(REPORT_TIME)
+        self.mcu.add_config_cmd(
+            "query_thermocouple oid=%u clock=%u rest_ticks=%u"
+            " min_value=%u max_value=%u" % (
+                self.oid, clock, self._report_clock,
+                self.min_sample_value, self.max_sample_value), is_init=True)
+    def _handle_spi_response(self, params):
+        temp = self.calc_temp(params['value'], params['fault'])
+        next_clock      = self.mcu.clock32_to_clock64(params['next_clock'])
+        last_read_clock = next_clock - self._report_clock
+        last_read_time  = self.mcu.clock_to_print_time(last_read_clock)
+        self._callback(last_read_time, temp)
+    def fault(self, msg):
+        self.printer.invoke_async_shutdown(msg)
+
+
+class MCP3204(SensorBase):
+    def __init__(self, config):
+        self.channel = config.getint('channel', 0)
+        SensorBase.__init__(self, config, "MCP3204",
+                            self.build_spi_init(config))
+    def calc_temp(self, adc, fault):
+        temp = (adc >> 6) & (0b111111111111)
+        return temp
+    def calc_adc(self, temp):
+        adc = int( temp + 0.5 ) # convert to ADC value
+        return adc
+    def build_spi_init(self, config):
+        cmd = (0b10000000 | (self.channel << 4))
+        return [cmd, 0x00, 0x00]
+
+
+######################################################################
+# Sensor registration
+######################################################################
+
+Sensors = {
+    "MCP3204": MCP3204,
+}
+
+def load_config(config):
+    # Register sensors
+    pheaters = config.get_printer().load_object(config, "heaters")
+    for name, klass in Sensors.items():
+        pheaters.add_sensor_factory(name, klass)
